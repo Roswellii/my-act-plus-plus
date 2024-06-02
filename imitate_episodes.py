@@ -533,6 +533,19 @@ def forward_pass(data, policy):
 
 
 def train_bc(train_dataloader, val_dataloader, config):
+    """
+    训练行为克隆模型。
+
+    参数:
+    - train_dataloader: 训练数据的迭代器。
+    - val_dataloader: 验证数据的迭代器。
+    - config: 包含训练配置的字典，例如步数、检查点目录、随机种子等。
+
+    返回:
+    - best_ckpt_info: 最佳检查点的信息，包括步数、最小验证损失和策略的状态字典。
+    """
+
+    # 从配置中提取关键参数
     num_steps = config['num_steps']
     ckpt_dir = config['ckpt_dir']
     seed = config['seed']
@@ -542,24 +555,35 @@ def train_bc(train_dataloader, val_dataloader, config):
     validate_every = config['validate_every']
     save_every = config['save_every']
 
+    # 设置随机种子
     set_seed(seed)
 
+    # 创建策略实例
     policy = make_policy(policy_class, policy_config)
+    
+    # 加载预训练模型（如果配置指定）
     if config['load_pretrain']:
         loading_status = policy.deserialize(torch.load(os.path.join('/home/zfu/interbotix_ws/src/act/ckpts/pretrain_all', 'policy_step_50000_seed_0.ckpt')))
         print(f'loaded! {loading_status}')
+    
+    # 恢复策略检查点（如果配置指定）
     if config['resume_ckpt_path'] is not None:
         loading_status = policy.deserialize(torch.load(config['resume_ckpt_path']))
         print(f'Resume policy from: {config["resume_ckpt_path"]}, Status: {loading_status}')
+    
+    # 将策略移至GPU
     policy.cuda()
+    # 创建优化器
     optimizer = make_optimizer(policy_class, policy)
 
+    # 初始化最佳验证损失和对应的检查点信息
     min_val_loss = np.inf
     best_ckpt_info = None
     
+    # 对训练数据迭代器应用重复器增强
     train_dataloader = repeater(train_dataloader)
     for step in tqdm(range(num_steps+1)):
-        # validation
+        # 按配置频率进行验证
         if step % validate_every == 0:
             print('validating')
 
@@ -569,7 +593,7 @@ def train_bc(train_dataloader, val_dataloader, config):
                 for batch_idx, data in enumerate(val_dataloader):
                     forward_dict = forward_pass(data, policy)
                     validation_dicts.append(forward_dict)
-                    if batch_idx > 50:
+                    if batch_idx > 50:  # 仅处理前50个批次用于效率
                         break
 
                 validation_summary = compute_dict_mean(validation_dicts)
@@ -587,33 +611,36 @@ def train_bc(train_dataloader, val_dataloader, config):
                 summary_string += f'{k}: {v.item():.3f} '
             print(summary_string)
                 
-        # evaluation
+        # 按配置频率进行评估
         if (step > 0) and (step % eval_every == 0):
-            # first save then eval
+            # 先保存检查点再进行评估
             ckpt_name = f'policy_step_{step}_seed_{seed}.ckpt'
             ckpt_path = os.path.join(ckpt_dir, ckpt_name)
             torch.save(policy.serialize(), ckpt_path)
             success, _ = eval_bc(config, ckpt_name, save_episode=True, num_rollouts=10)
             wandb.log({'success': success}, step=step)
 
-        # training
+        # 进行训练
         policy.train()
         optimizer.zero_grad()
         data = next(train_dataloader)
         forward_dict = forward_pass(data, policy)
-        # backward
+        # 反向传播
         loss = forward_dict['loss']
         loss.backward()
         optimizer.step()
-        wandb.log(forward_dict, step=step) # not great, make training 1-2% slower
+        wandb.log(forward_dict, step=step) # 训练日志记录
 
+        # 按配置频率保存检查点
         if step % save_every == 0:
             ckpt_path = os.path.join(ckpt_dir, f'policy_step_{step}_seed_{seed}.ckpt')
             torch.save(policy.serialize(), ckpt_path)
 
+    # 保存最后一个检查点
     ckpt_path = os.path.join(ckpt_dir, f'policy_last.ckpt')
     torch.save(policy.serialize(), ckpt_path)
 
+    # 保存和返回最佳检查点信息
     best_step, min_val_loss, best_state_dict = best_ckpt_info
     ckpt_path = os.path.join(ckpt_dir, f'policy_step_{best_step}_seed_{seed}.ckpt')
     torch.save(best_state_dict, ckpt_path)
